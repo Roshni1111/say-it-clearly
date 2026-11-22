@@ -1,0 +1,14 @@
+{
+  "name": "Say It Clearly",
+  "short_name": "Say It",
+  "description": "Speak English with a coach that fixes your words as you talk.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F5F7F6",
+  "theme_color": "#1D6B57",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
