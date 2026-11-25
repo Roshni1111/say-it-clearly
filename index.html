@@ -360,11 +360,20 @@ function parseJSON(text) {
   throw { code: "bad_reply" };
 }
 const API = "https://generativelanguage.googleapis.com/v1beta/";
+let onStep = null; // optional progress callback, used by the key test
+const step = (t) => { try { onStep && onStep(t); } catch {} };
+async function fetchT(url, opts, ms) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ctl.signal }); }
+  catch (e) { if (ctl.signal.aborted) throw { code: "timeout" }; throw { code: "network" }; }
+  finally { clearTimeout(timer); }
+}
 const verOf = (n) => parseFloat((n.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1]) || 0;
 // Ask Google which models this key can use, best fast text model first.
 async function listModels(key) {
-  let res;
-  try { res = await fetch(API + "models?pageSize=1000", { headers: { "x-goog-api-key": key } }); } catch { throw { code: "network" }; }
+  step("Checking your key with Google...");
+  const res = await fetchT(API + "models?pageSize=1000", { headers: { "x-goog-api-key": key } }, 20000);
   const j = await res.json().catch(() => ({}));
   const detail = j.error && j.error.message;
   if (!res.ok) throw { code: res.status === 429 ? "rate_limited" : [400, 401, 403].includes(res.status) ? "bad_key" : "upstream", detail };
@@ -385,17 +394,21 @@ async function ask(prompt) {
   let last = null;
   for (const model of order) {
     for (const json of [true, false]) {
+      step("Asking " + model + "...");
       let res;
       try {
-        res = await fetch(`${API}models/${model}:generateContent`, {
+        res = await fetchT(`${API}models/${model}:generateContent`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-goog-api-key": key },
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             generationConfig: json ? { responseMimeType: "application/json", temperature: 0.7 } : { temperature: 0.7 },
           }),
-        });
-      } catch { throw { code: "network" }; }
+        }, 45000);
+      } catch (e) {
+        if (e.code === "timeout") throw { code: "timeout", detail: model + " did not answer in 45 seconds" };
+        throw e;
+      }
       if (res.ok) {
         const j = await res.json();
         const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map((p) => p.text || "").join("");
@@ -424,6 +437,7 @@ function errText(e) {
     case "bad_key": return "The coach key didn't work. Check it in Setup." + why;
     case "rate_limited": return "Free limit reached for now. Wait a minute and try again." + why;
     case "offline": case "network": return "No internet. Connect and try again.";
+    case "timeout": return "Google took too long to answer. Try again." + why;
     case "bad_reply": return "The coach's answer came back garbled. Try again.";
     default: return "Couldn't get a reply." + why;
   }
@@ -837,11 +851,14 @@ $("#save-key").onclick = async () => {
   if (!k) { st.textContent = "Paste your key first."; return; }
   store.set("key", k); store.set("models", null); store.set("model", "");
   st.textContent = "Testing...";
+  onStep = (t) => { st.textContent = t; };
   try {
     const r = await ask('Reply with only JSON: {"ok": true}');
-    st.textContent = r && r.ok ? "Saved. The coach is ready." : "Saved, but the test answer looked odd. Try talking anyway.";
-    if (r && r.ok) setTimeout(() => { showTab("talk"); startTopic(); }, 700);
+    const m = store.get("model", "");
+    st.textContent = r && r.ok ? "Saved. The coach is ready" + (m ? " (" + m + ")." : ".") : "Saved, but the test answer looked odd. Try talking anyway.";
+    if (r && r.ok) setTimeout(() => { showTab("today"); }, 1200);
   } catch (e) { st.textContent = errText(e); }
+  finally { onStep = null; }
 };
 $("#clear-key").onclick = () => { store.set("key", ""); $("#key").value = ""; $("#key-status").textContent = "Key removed from this phone."; };
 
