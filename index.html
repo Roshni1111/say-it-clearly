@@ -359,48 +359,73 @@ function parseJSON(text) {
   if (a >= 0 && b > a) { try { return JSON.parse(text.slice(a, b + 1)); } catch {} }
   throw { code: "bad_reply" };
 }
+const API = "https://generativelanguage.googleapis.com/v1beta/";
+const verOf = (n) => parseFloat((n.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1]) || 0;
+// Ask Google which models this key can use, best fast text model first.
+async function listModels(key) {
+  let res;
+  try { res = await fetch(API + "models?pageSize=1000", { headers: { "x-goog-api-key": key } }); } catch { throw { code: "network" }; }
+  const j = await res.json().catch(() => ({}));
+  const detail = j.error && j.error.message;
+  if (!res.ok) throw { code: res.status === 429 ? "rate_limited" : [400, 401, 403].includes(res.status) ? "bad_key" : "upstream", detail };
+  const names = (j.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => m.name.replace(/^models\//, ""));
+  const text = names.filter((n) => /gemini/i.test(n) && !/image|tts|audio|live|embed|vision|robotics|computer/i.test(n));
+  const stable = text.filter((n) => /flash/i.test(n) && !/exp|preview|thinking/i.test(n));
+  const rank = (n) => verOf(n) * 10 - (/lite/i.test(n) ? 3 : 0) + (/latest/i.test(n) ? 5 : 0);
+  stable.sort((a, b) => rank(b) - rank(a));
+  return stable.concat(text.filter((n) => !stable.includes(n)));
+}
 async function ask(prompt) {
   const key = store.get("key", "");
   if (!key) throw { code: "no_key" };
   if (!navigator.onLine) throw { code: "offline" };
-  const order = [store.get("model", MODELS[0]), ...MODELS].filter((m, i, a) => a.indexOf(m) === i);
+  let models = store.get("models", null);
+  if (!Array.isArray(models) || !models.length) { models = await listModels(key); store.set("models", models); }
+  const order = [store.get("model", ""), ...models.slice(0, 5), ...MODELS].filter((m, i, a) => m && a.indexOf(m) === i);
+  let last = null;
   for (const model of order) {
-    let res;
-    try {
-      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: "application/json", temperature: 0.7 },
-        }),
-      });
-    } catch { throw { code: "network" }; }
-    if (res.status === 404) continue;
-    if (res.status === 429) throw { code: "rate_limited" };
-    if (res.status === 400 || res.status === 401 || res.status === 403) {
+    for (const json of [true, false]) {
+      let res;
+      try {
+        res = await fetch(`${API}models/${model}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: json ? { responseMimeType: "application/json", temperature: 0.7 } : { temperature: 0.7 },
+          }),
+        });
+      } catch { throw { code: "network" }; }
+      if (res.ok) {
+        const j = await res.json();
+        const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map((p) => p.text || "").join("");
+        if (!text) { last = { code: "bad_reply" }; break; }
+        store.set("model", model);
+        return parseJSON(text);
+      }
       const j = await res.json().catch(() => ({}));
-      const msg = (j.error && j.error.message) || "";
-      if (/api key|API_KEY|permission|unauth/i.test(msg) || res.status !== 400) throw { code: "bad_key" };
-      continue; // model does not accept this request shape, try the next one
+      const msg = (j.error && j.error.message) || "HTTP " + res.status;
+      last = { code: "upstream", detail: model + ": " + msg };
+      if (res.status === 401 || res.status === 403 || /api key not valid|API_KEY_INVALID/i.test(msg)) throw { code: "bad_key", detail: msg };
+      if (res.status === 429) {
+        if (/limit: 0|free_tier|not available/i.test(msg)) break; // this model has no free quota, try the next one
+        throw { code: "rate_limited", detail: msg };
+      }
+      if (res.status === 400 && json) continue; // retry this model without JSON mode
+      break; // try the next model
     }
-    if (!res.ok) { if (res.status >= 500) continue; throw { code: "upstream" }; }
-    const j = await res.json();
-    const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map((p) => p.text || "").join("");
-    if (!text) throw { code: "bad_reply" };
-    store.set("model", model);
-    return parseJSON(text);
   }
-  throw { code: "upstream" };
+  throw last || { code: "upstream" };
 }
 function errText(e) {
+  const why = e && e.detail ? " Google says: " + String(e.detail).slice(0, 180) : "";
   switch (e && e.code) {
     case "no_key": return "Add your free coach key in Setup first.";
-    case "bad_key": return "The coach key didn't work. Check it in Setup.";
-    case "rate_limited": return "Free limit reached for now. Wait a minute and try again.";
+    case "bad_key": return "The coach key didn't work. Check it in Setup." + why;
+    case "rate_limited": return "Free limit reached for now. Wait a minute and try again." + why;
     case "offline": case "network": return "No internet. Connect and try again.";
-    case "bad_reply": return "The coach's answer came back garbled.";
-    default: return "Couldn't get a reply.";
+    case "bad_reply": return "The coach's answer came back garbled. Try again.";
+    default: return "Couldn't get a reply." + why;
   }
 }
 
@@ -810,7 +835,7 @@ $("#save-key").onclick = async () => {
   const k = $("#key").value.trim();
   const st = $("#key-status");
   if (!k) { st.textContent = "Paste your key first."; return; }
-  store.set("key", k);
+  store.set("key", k); store.set("models", null); store.set("model", "");
   st.textContent = "Testing...";
   try {
     const r = await ask('Reply with only JSON: {"ok": true}');
